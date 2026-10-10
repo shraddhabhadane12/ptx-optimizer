@@ -1,0 +1,84 @@
+// PTX for vector addition kernel
+// Handcrafted to demonstrate all four optimizer passes.
+// Equivalent CUDA: C[i] = A[i] + B[i]
+//
+// INTENTIONAL INEFFICIENCIES (for the optimizer to find):
+//   1. %f6 is computed but never stored          → DIE removes it
+//   2. add with 0.0f on %f_zero                  → Algebraic simplification
+//   3. mul by 1.0f on loaded value               → Algebraic simplification
+//   4. Redundant register copy (%rd3 = %rd2)     → Copy elimination
+//   5. Constant 1.0 + 1.0 folded at compile time → Constant folding
+
+.version 7.5
+.target sm_89
+.address_size 64
+
+.visible .entry vectorAdd(
+    .param .u64 param_A,
+    .param .u64 param_B,
+    .param .u64 param_C,
+    .param .u32 param_N
+)
+{
+    .reg .pred   %p<3>;
+    .reg .f32    %f<16>;
+    .reg .b32    %r<8>;
+    .reg .b64    %rd<8>;
+
+    // ── Load kernel parameters ─────────────────────────────────────────
+    ld.param.u64    %rd0, [param_A];
+    ld.param.u64    %rd1, [param_B];
+    ld.param.u64    %rd2, [param_C];
+    ld.param.u32    %r0,  [param_N];
+
+    // ── Compute thread index: tid = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32         %r1, %ntid.x;
+    mov.u32         %r2, %ctaid.x;
+    mov.u32         %r3, %tid.x;
+    mad.lo.u32      %r4, %r2, %r1, %r3;
+
+    // ── Bounds check: if tid >= N, exit ────────────────────────────────
+    setp.ge.u32     %p0, %r4, %r0;
+    @%p0 bra        END;
+
+    // ── [INTENTIONAL] Redundant copy: %rd3 = %rd2 ──────────────────────
+    // Copy elimination will propagate %rd2 into subsequent uses of %rd3
+    mov.u64         %rd3, %rd2;
+
+    // ── Convert tid to byte offset (tid * 4) ───────────────────────────
+    mul.wide.u32    %rd4, %r4, 4;
+
+    // ── Compute pointers ───────────────────────────────────────────────
+    add.u64         %rd5, %rd0, %rd4;   // A + offset
+    add.u64         %rd6, %rd1, %rd4;   // B + offset
+    add.u64         %rd7, %rd3, %rd4;   // C + offset  (uses redundant %rd3)
+
+    // ── Load A[i] and B[i] ─────────────────────────────────────────────
+    ld.global.f32   %f0, [%rd5];
+    ld.global.f32   %f1, [%rd6];
+
+    // ── [INTENTIONAL] Algebraic: mul by 1.0 is identity ────────────────
+    mul.f32         %f2, %f0, 0f3F800000;   // %f0 * 1.0 = %f0
+
+    // ── [INTENTIONAL] Algebraic: add 0.0 is identity ───────────────────
+    mov.f32         %f_zero, 0f00000000;
+    add.f32         %f3, %f1, %f_zero;      // %f1 + 0.0 = %f1
+
+    // ── Actual computation ─────────────────────────────────────────────
+    add.f32         %f4, %f2, %f3;
+
+    // ── [INTENTIONAL] Dead instruction: %f6 is never stored ────────────
+    add.f32         %f6, %f0, %f1;      // dead — result never used
+
+    // ── [INTENTIONAL] Constant fold: 1.0 + 1.0 = 2.0 ──────────────────
+    mov.f32         %f7, 0f3F800000;    // %f7 = 1.0
+    mov.f32         %f8, 0f3F800000;    // %f8 = 1.0
+    add.f32         %f9, %f7, %f8;      // %f9 = 2.0  (foldable)
+    // Note: %f9 is also dead after fold unless stored — DIE will catch it
+
+    // ── Store result ───────────────────────────────────────────────────
+    st.global.f32   [%rd7], %f4;
+
+END:
+    ret;
+}

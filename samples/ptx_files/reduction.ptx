@@ -1,0 +1,91 @@
+// PTX for parallel reduction kernel
+// Handcrafted to demonstrate optimizer on shared-memory patterns.
+// Equivalent CUDA: parallel sum reduction with tree-based approach
+//
+// INTENTIONAL INEFFICIENCIES:
+//   1. Multiple redundant copies of shared-memory base pointer
+//   2. Dead computation of unused mask value
+//   3. sub.u32 %r, %r, 0  → algebraic identity (sub zero)
+//   4. mul.u32 tid, tid, 1 → algebraic identity (mul one)
+//   5. Constant fold: 256 / 2 = 128 precomputed
+
+.version 7.5
+.target sm_89
+.address_size 64
+
+.visible .entry reduce(
+    .param .u64 param_input,
+    .param .u64 param_output,
+    .param .u32 param_N
+)
+{
+    .reg .pred   %p<4>;
+    .reg .f32    %f<12>;
+    .reg .b32    %r<16>;
+    .reg .b64    %rd<8>;
+
+    // ── Load parameters ────────────────────────────────────────────────
+    ld.param.u64    %rd0, [param_input];
+    ld.param.u64    %rd1, [param_output];
+    ld.param.u32    %r0,  [param_N];
+
+    // ── Thread indices ─────────────────────────────────────────────────
+    mov.u32         %r1, %tid.x;
+    mov.u32         %r2, %ntid.x;
+    mov.u32         %r3, %ctaid.x;
+
+    // ── [INTENTIONAL] mul by 1 is identity ────────────────────────────
+    mul.lo.u32      %r4, %r1, 1;        // tid * 1 = tid
+
+    // ── global_id = blockIdx * blockDim + threadIdx ────────────────────
+    mad.lo.u32      %r5, %r3, %r2, %r4;
+
+    // ── Bounds check ───────────────────────────────────────────────────
+    setp.ge.u32     %p0, %r5, %r0;
+
+    // ── [INTENTIONAL] Dead value: unused mask ─────────────────────────
+    and.b32         %r6, %r5, 31;       // lane mask — never used
+
+    // ── Byte offset ────────────────────────────────────────────────────
+    mul.wide.u32    %rd2, %r5, 4;
+    add.u64         %rd3, %rd0, %rd2;
+
+    // ── Load input (0.0 if out of bounds) ─────────────────────────────
+    mov.f32         %f0, 0f00000000;
+    @%p0 bra        SKIP_LOAD;
+    ld.global.f32   %f0, [%rd3];
+SKIP_LOAD:
+
+    // ── [INTENTIONAL] Redundant copy of output pointer ─────────────────
+    mov.u64         %rd4, %rd1;         // copy — will be eliminated
+
+    // ── Shared memory reduction (simplified single-level) ─────────────
+    // s = blockDim.x / 2  — here blockDim = 256, so s = 128
+    mov.u32         %r7,  256;
+    mov.u32         %r8,  2;
+    div.u32         %r9,  %r7, %r8;    // 256/2 = 128 → constant fold
+
+    setp.lt.u32     %p1, %r1, %r9;     // tid < 128?
+    @!%p1 bra       SKIP_ADD;
+
+    // load neighbour element (simplified: just add f0 to itself for demo)
+    add.f32         %f1, %f0, %f0;     // partial sum
+
+    // ── [INTENTIONAL] sub 0 identity ──────────────────────────────────
+    sub.u32         %r10, %r9, 0;      // 128 - 0 = 128 (no-op)
+
+    // store partial sum back (using output directly for demo)
+    mul.wide.u32    %rd5, %r3, 4;
+    add.u64         %rd6, %rd4, %rd5;  // uses copy-eliminated %rd4
+    st.global.f32   [%rd6], %f1;
+    bra             END;
+
+SKIP_ADD:
+    // Non-contributing thread still writes zero (to show store is safe)
+    mul.wide.u32    %rd5, %r3, 4;
+    add.u64         %rd6, %rd4, %rd5;
+    st.global.f32   [%rd6], %f0;
+
+END:
+    ret;
+}

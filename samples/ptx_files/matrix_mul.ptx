@@ -1,0 +1,93 @@
+// PTX for matrix multiplication kernel (simplified)
+// Handcrafted to exercise constant folding and algebraic simplification
+// on index computation patterns common in tiled matrix multiply.
+//
+// INTENTIONAL INEFFICIENCIES:
+//   1. TILE_SIZE * TILE_SIZE = 16 * 16 = 256 → constant fold
+//   2. row * 1 → algebraic (mul by 1)
+//   3. Dead intermediate index never stored
+//   4. xor %r, %r → algebraic (x ^ x = 0)
+//   5. Redundant copy of row pointer
+
+.version 7.5
+.target sm_89
+.address_size 64
+
+.visible .entry matMul(
+    .param .u64 param_A,
+    .param .u64 param_B,
+    .param .u64 param_C,
+    .param .u32 param_N
+)
+{
+    .reg .pred   %p<4>;
+    .reg .f32    %f<8>;
+    .reg .b32    %r<20>;
+    .reg .b64    %rd<12>;
+
+    // ── Load parameters ────────────────────────────────────────────────
+    ld.param.u64    %rd0, [param_A];
+    ld.param.u64    %rd1, [param_B];
+    ld.param.u64    %rd2, [param_C];
+    ld.param.u32    %r0,  [param_N];
+
+    // ── Thread / block indices ─────────────────────────────────────────
+    mov.u32         %r1,  %tid.x;       // threadIdx.x
+    mov.u32         %r2,  %tid.y;       // threadIdx.y
+    mov.u32         %r3,  %ctaid.x;     // blockIdx.x
+    mov.u32         %r4,  %ctaid.y;     // blockIdx.y
+
+    // ── Tile size constant = 16 ───────────────────────────────────────
+    mov.u32         %r5,  16;
+
+    // ── row = blockIdx.y * 16 + threadIdx.y ───────────────────────────
+    mad.lo.u32      %r6,  %r4, %r5, %r2;
+
+    // ── col = blockIdx.x * 16 + threadIdx.x ───────────────────────────
+    mad.lo.u32      %r7,  %r3, %r5, %r1;
+
+    // ── [INTENTIONAL] TILE_SIZE * TILE_SIZE = constant fold ───────────
+    mov.u32         %r8,  16;
+    mov.u32         %r9,  16;
+    mul.lo.u32      %r10, %r8, %r9;    // 16 * 16 = 256 → fold
+
+    // ── [INTENTIONAL] mul row by 1 ────────────────────────────────────
+    mul.lo.u32      %r11, %r6, 1;      // row * 1 = row → algebraic
+
+    // ── [INTENTIONAL] xor register with itself ────────────────────────
+    xor.b32         %r12, %r7, %r7;    // col ^ col = 0 → algebraic
+
+    // ── [INTENTIONAL] Dead intermediate: tile_offset never used ────────
+    mul.lo.u32      %r13, %r10, %r5;   // 256 * 16 = 4096 — dead
+
+    // ── Bounds check ───────────────────────────────────────────────────
+    setp.ge.u32     %p0, %r6,  %r0;    // row >= N?
+    setp.ge.u32     %p1, %r7,  %r0;    // col >= N?
+    or.pred         %p2, %p0, %p1;
+    @%p2 bra        END;
+
+    // ── [INTENTIONAL] Redundant pointer copy ──────────────────────────
+    mov.u64         %rd3, %rd0;        // copy of A pointer
+
+    // ── Compute flat index: row * N + col ─────────────────────────────
+    mad.lo.u32      %r14, %r11, %r0, %r7;   // uses %r11 (= row after mul.1)
+
+    // ── Load A[row][col] and B[row][col] (simplified: same index) ─────
+    mul.wide.u32    %rd4, %r14, 4;
+    add.u64         %rd5, %rd3, %rd4;   // uses copy-eliminated %rd3
+    add.u64         %rd6, %rd1, %rd4;
+
+    ld.global.f32   %f0, [%rd5];
+    ld.global.f32   %f1, [%rd6];
+
+    // ── Multiply-accumulate (simplified single element) ────────────────
+    mul.f32         %f2, %f0, %f1;
+
+    // ── Store result ───────────────────────────────────────────────────
+    mul.wide.u32    %rd7, %r14, 4;
+    add.u64         %rd8, %rd2, %rd7;
+    st.global.f32   [%rd8], %f2;
+
+END:
+    ret;
+}
